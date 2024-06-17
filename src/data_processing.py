@@ -7,7 +7,29 @@ from UTILS.utils import *
 from datetime import datetime
 import time
 from multiprocessing import cpu_count
-import tqdm
+import threading
+import time
+from tqdm import tqdm 
+from threading import Lock
+
+processed_ids_lock = Lock()
+
+def reset_counter():
+    global request_counter
+    while True:
+        try:
+            time.sleep(60)
+            with counter_lock:
+                request_counter = 0
+                print("Request counter reset.")
+        except Exception as e:
+            print(f"Error in resetting counter: {e}")
+
+# Start the reset counter thread
+reset_thread = threading.Thread(target=reset_counter)
+reset_thread.daemon = True
+reset_thread.start()
+
 
 
 def process_row(row, already_processed_ids):
@@ -26,9 +48,12 @@ def process_row(row, already_processed_ids):
 
     product_id, product_name, price, domain = row
 
-    if str(product_id) in already_processed_ids:    
-        return None
-  
+    with processed_ids_lock:
+        if str(product_id) in already_processed_ids:
+            return None
+        # Add the product_id to the set to mark it as being processed
+        already_processed_ids.add(str(product_id))
+    
     attempts = 0
     max_attempts = 2
     qty = 0
@@ -36,6 +61,7 @@ def process_row(row, already_processed_ids):
     # Try up to two times to find a non-zero quantity
     while attempts < max_attempts and qty == 0:
         max_qty = find_max_quantity(domain, [product_id])
+
         qty = max_qty.get(product_id, 0)
         attempts += 1
         if qty == 0:
@@ -44,63 +70,56 @@ def process_row(row, already_processed_ids):
     if qty == 0:
         return None
     else:
-       
-        already_processed_ids.add(str(product_id)) 
+        
         return (product_id, product_name, price, domain, qty, datetime.now())
 
 
 
 
-def handle_future_result(future, low_quantity_ids, cur, target_table, data_to_insert, data_to_update):
-    try:
-        result = future.result()
-        if result:
-            product_id = result[0]
-            if product_id in low_quantity_ids:
-                cur.execute(f"SELECT Quantity FROM {target_table} WHERE Product_ID = %s", (product_id,))
-                old_qty = cur.fetchone()[0]
-                if old_qty != result[4]:
-                    data_to_update.append(result)
-            else:
-                data_to_insert.append(result)
-            return True
-    except Exception as e:
-        print(f"An error occurred processing a row: {e}")
-    return False
-
-
-
-
-def process_rows_concurrently(rows, already_processed_ids):
-    with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
+def process_rows_concurrently(rows, already_processed_ids, cur, target_table, conn,low_quantity_ids):
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        # Submit all tasks and store them in a dictionary with their corresponding row
         futures = {executor.submit(process_row, row, already_processed_ids): row for row in rows}
-        return futures
+        
+        # Initialize lists to collect results for batch processing
+        data_to_insert = []
+        data_to_update = []
+        results_count = 0
+            # Initialize tqdm progress bar
+     
+
+        # Use tqdm to create a progress bar for the as_completed iterator
+        for future in as_completed(futures):
+            if future.done():
+                try:
+                    result = future.result()  # Get the result from the future
+              
+                    if result:
+                        # Assuming result format includes a flag or data indicating if it's an update or insert
+                        if result[0] in low_quantity_ids:  # Example condition, adjust based on actual logic
+                            data_to_update.append(result)
+                        else:
+                            data_to_insert.append(result)
+                        results_count += 1
+                      
+
+                        # Check if it's time to batch process
+                        if results_count >= 20:
+                            batch_insert_to_database(conn, data_to_insert, target_table)
+                            data_to_insert = []
+                            data_to_update = []
+                            results_count = 0
+
+                except Exception as e:
+                    print(f"An error occurred: {e}")
+        
+        # Final batch processing for any remaining data
+        if data_to_insert or data_to_update:
+            batch_insert_to_database(conn, data_to_insert, target_table)
+            update_database(conn, data_to_update, target_table)
 
 
 
-def handle_results(futures, low_quantity_ids, cur, target_table, conn):
-    
-    data_to_insert = []
-    data_to_update = []
-    results_count = 0
-    processed_count = 0
-    start_time = time.time()
-
-    for future in tqdm(as_completed(futures), total=len(futures), desc="Processing products"):
-        result = handle_future_result(future, low_quantity_ids, cur, target_table, data_to_insert, data_to_update)
-        if result:
-            results_count += 1
-            processed_count += 1
-
-            check_rate_limit(processed_count, start_time)
-            if results_count >= 5:
-                batch_insert_to_database(conn, data_to_insert, target_table)
-                update_database(conn, data_to_update, target_table)
-                data_to_insert = []
-                data_to_update = []
-                results_count = 0
-
-    return data_to_insert, data_to_update
 
 
 def process_data_for_all_domains(domain_tables):
@@ -113,7 +132,7 @@ def process_data_for_all_domains(domain_tables):
     Returns:
     None
     """
-    with ProcessPoolExecutor(max_workers=10) as executor:
+    with ProcessPoolExecutor(max_workers=cpu_count()) as executor:
         futures = []
         for domain_table in domain_tables:
             future = executor.submit(process_domain_table, domain_table)
@@ -166,15 +185,13 @@ def fetch_and_process_data(conn, domain_table, target_table):
     Returns:
     None
     """
-    ensure_table_exists(conn, target_table)
-    cur = conn.cursor()
-    now = datetime.now()
-    start_of_day = datetime(now.year, now.month, now.day)
-    already_processed_ids, low_quantity_ids = fetch_already_processed_ids(cur, target_table, start_of_day, now)
-    rows = fetch_product_rows(cur, domain_table)
-    futures = process_rows_concurrently(rows, already_processed_ids)
-    data_to_insert, data_to_update = handle_results(futures, low_quantity_ids, cur, target_table, conn)
-    if data_to_insert:
-        batch_insert_to_database(conn, data_to_insert, target_table)
-    if data_to_update:
-        update_database(conn, data_to_update, target_table)
+    try:
+        ensure_table_exists(conn, target_table)
+        cur = conn.cursor()
+        now = datetime.now()
+        start_of_day = datetime(now.year, now.month, now.day)
+        already_processed_ids, low_quantity_ids = fetch_already_processed_ids(cur, target_table, start_of_day, now)
+        rows = fetch_product_rows(cur, domain_table)
+        process_rows_concurrently(rows, already_processed_ids, cur, target_table, conn, low_quantity_ids)
+    except Exception as e:
+        print(f"Error during data fetch and processing for table {domain_table}: {e}")

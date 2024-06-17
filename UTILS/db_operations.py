@@ -34,25 +34,34 @@ def ensure_table_exists(conn, table_name):
 
 def batch_insert_to_database(conn, data, table_name):
     cur = conn.cursor()
-    insert_query = f'''
-        INSERT INTO {table_name} (Product_ID, Product_Name, Price, Domain, Quantity, Date)
-        VALUES (%s, %s, %s, %s, %s, %s)
-    '''
-    cur.executemany(insert_query, data)
-    conn.commit()
+    try:
+        insert_query = f'''
+            INSERT INTO {table_name} (Product_ID, Product_Name, Price, Domain, Quantity, Date)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        '''
+        cur.executemany(insert_query, data)
+        conn.commit()
+        print(f"Successfully uploaded {len(data)} records to {table_name}.")
+    except mysql.connector.Error as e:
+        print(f"Failed to insert data: {e}")
+        conn.rollback()
 
 
 def update_database(conn, data, table_name):
     cur = conn.cursor()
-    update_query = f'''
-        UPDATE {table_name}
-        SET Product_Name = %s, Price = %s, Domain = %s, Quantity = %s
-        WHERE Product_ID = %s AND DATE(Date) = DATE(%s)
-    '''
-    # Prepare data for update (note the order of fields should match the SQL query)
-    data_for_update = [(item[1], item[2], item[3], item[4], item[5], item[0]) for item in data]
-    cur.executemany(update_query, data_for_update)
-    conn.commit()
+    try:
+        update_query = f'''
+            UPDATE {table_name}
+            SET Product_Name = %s, Price = %s, Domain = %s, Quantity = %s
+            WHERE Product_ID = %s AND DATE(Date) = DATE(%s)
+        '''
+        # Prepare data for update (note the order of fields should match the SQL query)
+        data_for_update = [(item[1], item[2], item[3], item[4], item[5], item[0]) for item in data]
+        cur.executemany(update_query, data_for_update)
+        conn.commit()
+    except mysql.connector.Error as e:
+        print(f"Failed to update data: {e}")
+        conn.rollback()
 
 
 def ensure_table_exists_with_structure(conn, table_name):
@@ -80,11 +89,21 @@ def create_qty_table_if_not_exists(conn, domain_table):
 
 
 def fetch_already_processed_ids(cur, target_table, start_of_day, now):
-    cur.execute(f"SELECT Product_ID, Quantity FROM {target_table} WHERE Date >= %s AND Date < %s", (start_of_day, now))
-    already_processed_ids = {str(row[0]) for row in cur.fetchall()}
-    low_quantity_ids = {str(row[0]) for row in cur.fetchall() if row[1] < 10}
-    return already_processed_ids, low_quantity_ids
+    try:
+        cur.execute(f"SELECT Product_ID, Quantity FROM {target_table} WHERE Date >= %s AND Date < %s", (start_of_day, now))
+        rows = cur.fetchall()
+        already_processed_ids = {str(row[0]) for row in rows}
+        low_quantity_ids = {str(row[0]) for row in rows if row[1] < 10}
+        return already_processed_ids, low_quantity_ids
+    except mysql.connector.Error as e:
+        print(f"Failed to fetch processed IDs: {e}")
+        return set(), set()
+
 
 def fetch_product_rows(cur, domain_table):
-    cur.execute(f"SELECT Product_ID, Product_Name, Price, Domain FROM {domain_table}")
-    return cur.fetchall()
+    try:
+        cur.execute(f"SELECT Product_ID, Product_Name, Price, Domain FROM {domain_table}")
+        return cur.fetchall()
+    except mysql.connector.Error as e:
+        print(f"Failed to fetch product rows: {e}")
+        return []

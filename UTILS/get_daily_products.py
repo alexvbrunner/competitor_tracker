@@ -2,7 +2,7 @@ import requests
 import xml.etree.ElementTree as ET
 import sqlite3
 import mysql
-from UTILS.server_utils import connect_to_mysql_db
+from UTILS.db_operations import connect_to_mysql_db
 
 
 # List of domains to scrape
